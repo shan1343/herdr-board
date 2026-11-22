@@ -1,0 +1,4 @@
+﻿logs/*
+!logs/.gitkeep
+*.tmp
+board.local.config.json

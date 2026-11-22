@@ -1,0 +1,16 @@
+﻿{
+  "BoardTitle": "Herdr Board",
+  "HerdrCommand": "herdr",
+  "HerdrSocketPath": "%APPDATA%/herdr/sessions/example-session/herdr.sock",
+  "LogRoot": "logs",
+  "ClaudeUsageFile": "logs/claude-usage.json",
+  "AgyUsageFile": "logs/agy-usage.json",
+  "CodexSessionsPath": "logs/sample-codex-sessions",
+  "ClaudeSessionsPath": "logs/sample-claude-sessions",
+  "Agents": [
+    {"Pane":"w9:p1","Key":"claude","Name":"Planner","Role":"Planning"},
+    {"Pane":"w9:p2","Key":"codex","Name":"Builder","Role":"Building"},
+    {"Pane":"w9:p3","Key":"agy","Name":"Observer","Role":"Research"},
+    {"Pane":"w9:p4","Key":"codex","Name":"Tutor","Role":"Learning"}
+  ]
+}
