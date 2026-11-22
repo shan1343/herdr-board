@@ -1,12 +1,13 @@
-﻿param([ValidateRange(1,3600)][int]$Refresh=5,[switch]$Once,[int]$Width,[int]$Height,[string]$LogRoot=(Join-Path $PSScriptRoot 'logs'),[switch]$Demo)
+﻿param([ValidateRange(1,3600)][int]$Refresh=5,[switch]$Once,[int]$Width,[int]$Height,[string]$LogRoot,[switch]$Demo,
+      [string]$Session,[string]$SharedLogRoot,[string]$ProjectPath,[string]$CodexSessionsPath)
 # Live background jobs with their latest steps and one completed summary. Token-free (reads logs\exec-*.jsonl).
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 if(!$Once){ $Host.UI.RawUI.WindowTitle='백그라운드' }
-$L=$LogRoot
 . (Join-Path $PSScriptRoot 'board-workers.ps1')
 . (Join-Path $PSScriptRoot 'board-usage.ps1')
 . (Join-Path $PSScriptRoot 'board-render.ps1')
 . (Join-Path $PSScriptRoot 'board-demo.ps1')
+$workerScope=if (!$Demo) { New-BoardWorkerScope $LogRoot $Session $SharedLogRoot $ProjectPath $CodexSessionsPath }
 $claudeSessions=Join-Path ([Environment]::GetFolderPath('UserProfile')) '.claude\sessions'
 $e=[char]27; $cB="$e[1m"; $cC="$e[36m"; $cG="$e[32m"; $cM="$e[90m"; $cX="$e[0m"
 $platformNames=@{claude='Claude';codex='Codex';agy='agy'}
@@ -56,32 +57,33 @@ while($true){
   $w=[Math]::Max(1,$cols-1)
   $limit=[Math]::Max(1, $(if($Height){$Height}else{$size.Height})-1)
   $out=[Collections.Generic.List[string]]::new()
-  $out.Add("$e[1;97;48;2;233;84;32m  백그라운드  $($now.ToString('HH:mm:ss'))  v2.8  $cX")
+  $out.Add("$e[1;97;48;2;233;84;32m  백그라운드  $($now.ToString('HH:mm:ss'))  v2.9  $cX")
   $jobs=@()
   if($Demo){ $running=@((Get-BoardDemo $now).Workers.Active) }
   else{
-    $jobs=@(Get-ChildItem -LiteralPath $L -Filter 'exec-*.jsonl' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
-    $running=@((Get-BoardWorkers $L $claudeSessions).Active)
+    $snapshot=Get-BoardWorkers $workerScope.LogRoot $claudeSessions $workerScope
+    $jobs=@($snapshot.Jobs | Where-Object EventLog | Sort-Object { $_.EventLog.LastWriteTimeUtc } -Descending)
+    $running=@($snapshot.Active)
   }
   $doneLine=$null
   if($out.Count+$running.Count -lt $limit){
     foreach($job in $jobs){
-      $key=$job.BaseName.Substring(5)
+      $key=$job.Card
       if($key -in $running.Card){ continue }
-      $events=@(Read-WorkerEvents $job.FullName)
+      $events=@(Read-WorkerEvents $job.EventLog.FullName)
       if(!$events.Count -or $events[-1].type -ne 'turn.completed'){ continue }
       $message=($events | Where-Object {$_.item.type -eq 'agent_message'} | Select-Object -Last 1).item.text
       $sentence=(([string]$message -replace '[\x00-\x1f\x7f-\x9f]',' ' ).Trim() -split '(?<=[.!?。])\s+',2)[0]
       $chars=[Globalization.StringInfo]::new($sentence)
       if($chars.LengthInTextElements -gt 40){ $sentence=$chars.SubstringByTextElements(0,39)+'…' }
-      $title=Clean-BoardText (Get-BoardCardTitle $L $key $key)
+      $title=Clean-BoardText (Get-BoardCardTitle $job.Root $key $key)
       $doneLine="${cG}done$cX  $title  $sentence"
       break
     }
   }
   $details=[Math]::Max(0,$limit-$out.Count-$running.Count-[int][bool]$doneLine)
   foreach($worker in $running){
-    $stale=Test-BoardStale $L $worker.Card $now
+    $stale=if ($worker.Root) { Test-BoardStale $worker.Root $worker.Card $now } else { $false }
     $elapsed=Format-BoardElapsed $worker.Minutes -Stale:$stale
     $elapsedWidth=Get-BoardTextWidth ($elapsed -replace '\x1b\[[0-9;]*m','')
     $title="${cC}working$cX  $cB$(Clean-BoardText $worker.Title)$cX"
@@ -97,7 +99,7 @@ while($true){
       }
       if(!$model){ $model='—' }
       if(!$effort){ $effort='—' }
-      $last=if($worker.Card){ Read-WorkerEvents (Join-Path $L "exec-$($worker.Card).jsonl") | Select-Object -Last 1 }
+      $last=if($worker.LogPath){ Read-WorkerEvents $worker.LogPath | Select-Object -Last 1 }
       $out.Add("    $cM$platform · $model · $effort · 지금: $(Get-WorkerStep $last)$cX")
     }
   }

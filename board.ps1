@@ -7,7 +7,7 @@
     [switch]$Once
 )
 
-$Version='v2.8'
+$Version='v2.9'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . "$PSScriptRoot\board-demo.ps1"
 . "$PSScriptRoot\board-render.ps1"
@@ -16,29 +16,41 @@ $Version='v2.8'
 
 $configFile=Get-Item -LiteralPath $ConfigPath -ErrorAction Stop
 $config=Get-Content -LiteralPath $configFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-if(!$config.LogRoot){ $config | Add-Member -NotePropertyName LogRoot -NotePropertyValue 'logs' -Force }
-foreach($key in 'LogRoot','ClaudeUsageFile','ClaudeSessionsPath','AgyUsageFile','CodexSessionsPath','HerdrSocketPath'){
+foreach($key in 'LogRoot','SharedLogRoot','ProjectPath','ClaudeUsageFile','ClaudeSessionsPath','AgyUsageFile','CodexSessionsPath','HerdrSocketPath'){
     if(!$config.$key){ continue }
     $path=[Environment]::ExpandEnvironmentVariables([string]$config.$key)
     if(![IO.Path]::IsPathRooted($path)){ $path=Join-Path $configFile.DirectoryName $path }
     $config.$key=$path
 }
-if(!$Demo -and !$env:HERDR_SOCKET_PATH -and $config.HerdrSocketPath){ $env:HERDR_SOCKET_PATH=$config.HerdrSocketPath }
+$boardSession=$config.Session
 $herdrArgs=@()
 $context=$null
+$workerScope=$null
 $hasConfiguredAgents=$null -ne $config.PSObject.Properties['Agents']
-if(!$Demo){
-    if($hasConfiguredAgents){
-        if($config.Session){ $herdrArgs=@('--session',[string]$config.Session) }
-    }else{
-        . "$PSScriptRoot\session-context.ps1"
-        . "$PSScriptRoot\session-registry.ps1"
-        $context=if($config.Session){Get-WorkHerdrContext -Session $config.Session}else{Get-WorkHerdrContext}
-        $herdrArgs=@('--session',$context.Session)
+$logRoot=$config.LogRoot
+if (!$Demo) {
+    $fromConfig=Get-BoardSocketSession $config.HerdrSocketPath
+    if (!$boardSession -and !$env:HERDR_SESSION -and !$env:HERDR_SOCKET_PATH -and $fromConfig -ne 'work-herdr') {
+        $boardSession=$fromConfig
     }
+    if ($configFile.FullName -eq (Join-Path $PSScriptRoot 'board.config.json') -and
+        !$config.Session -and !$hasConfiguredAgents) { $logRoot=$null }
+    $workerScope=New-BoardWorkerScope $logRoot $boardSession $config.SharedLogRoot $config.ProjectPath $config.CodexSessionsPath
+    $logRoot=$workerScope.LogRoot
+
+    if (!$env:HERDR_SOCKET_PATH -and $config.HerdrSocketPath -and (!$fromConfig -or $fromConfig -eq $workerScope.Session)) {
+        $env:HERDR_SOCKET_PATH=$config.HerdrSocketPath
+    }
+    if (!$hasConfiguredAgents) {
+        . "$PSScriptRoot/session-context.ps1"
+        . "$PSScriptRoot/session-registry.ps1"
+        $context=if ($boardSession -or (!$env:HERDR_SESSION -and !$env:HERDR_SOCKET_PATH)) {
+            Get-WorkHerdrContext -Session $workerScope.Session
+        } else { Get-WorkHerdrContext }
+    }
+    if ($boardSession -or $context -or $env:HERDR_SESSION) { $herdrArgs=@('--session',$workerScope.Session) }
 }
 if(!$Once){ $Host.UI.RawUI.WindowTitle=$config.BoardTitle }
-$logRoot=$config.LogRoot
 $esc=[char]27
 $reset="$esc[0m"
 $bold="$esc[1m"
@@ -110,7 +122,7 @@ function Get-BoardTaskRows([string]$Backlog,$Workers,$Sessions,$UsageRows,[switc
     if(!$Completed){
         foreach($worker in $Workers.Active){
             $ordinal++
-            [pscustomobject]@{Kind=$worker.Agent;Owner=$agentNames[$worker.Agent];State='working';Title=$worker.Title;Minutes=$worker.Minutes;Model=$worker.Model;Effort=$worker.Effort;Device=$worker.Device;Card=$worker.Card;Order=$ordinal}
+            [pscustomobject]@{Kind=$worker.Agent;Owner=$agentNames[$worker.Agent];State='working';Title=$worker.Title;Minutes=$worker.Minutes;Model=$worker.Model;Effort=$worker.Effort;Device=$worker.Device;Card=$worker.Card;Root=$worker.Root;Order=$ordinal}
         }
     }
     foreach($line in ($Backlog -split '\r?\n')){
@@ -134,6 +146,10 @@ function Get-BoardTaskRows([string]$Backlog,$Workers,$Sessions,$UsageRows,[switc
         elseif($owner -eq '일꾼'){ $kind='codex' }
         if($kind){ $owner=$agentNames[$kind] }
         $card=if(!$Demo){ Get-BoardBacklogCard $logRoot $cells[0] $cells[1] }
+        if ($card) {
+            $cardRoom=if ($Workers.LocalOwners) { $Workers.LocalOwners[$card] }
+            if ($cardRoom -and $cardRoom -ne $workerScope.Session) { continue }
+        }
         if($state -eq 'working' -and ($Workers.Active | Where-Object {
             ($_.Card -and $_.Card -eq $card) -or ($_.Title -eq $cells[1] -and $_.Agent -eq $kind)
         })){ continue }
@@ -156,7 +172,8 @@ function Format-BoardTask($Task){
     $device=Clean-BoardText (Resolve-BoardDevice $Task.Device $config.MachineLabels $machines)
     if($device){ $content="$tagColor[$device]$reset $content" }
     if($Task.State -eq 'working'){
-        $stale=Test-BoardStale $logRoot $Task.Card $now
+        $activityRoot=if ($Task.Root) { $Task.Root } else { $logRoot }
+        $stale=Test-BoardStale $activityRoot $Task.Card $now
         $elapsed=" · $(Format-BoardElapsed $Task.Minutes -Stale:$stale)"
         $contentWidth=$w-$nameWidth-$middleWidth-7
         $titleWidth=$contentWidth-(Get-BoardTextWidth ($elapsed -replace '\x1b\[[0-9;]*m',''))
@@ -231,7 +248,7 @@ while($true){
         }
         $data=[pscustomobject]@{
             Sessions=$sessions; Agents=$agents
-            Workers=(Get-BoardWorkers $logRoot $config.ClaudeSessionsPath)
+            Workers=(Get-BoardWorkers $logRoot $config.ClaudeSessionsPath $workerScope)
             Backlog=(Read-BoardUsageText (Join-Path $logRoot 'backlog.md'))
             Done=(Read-BoardUsageText (Join-Path $logRoot 'backlog-done.md'))
             Usage=@(Get-BoardUsage $config $sessions)
@@ -279,7 +296,7 @@ while($true){
     $agentRows=$lines.Count-$agentStart
     $tasks=@(Get-BoardTaskRows $data.Backlog $data.Workers $data.Sessions $data.Usage | Sort-Object { if($taskOrder.ContainsKey($_.State)){$taskOrder[$_.State]}else{4} },Order)
     $visibleTasks=@($tasks)
-    $done=@(Get-BoardTaskRows $data.Done $null $data.Sessions -Completed)
+    $done=@(Get-BoardTaskRows $data.Done $data.Workers $data.Sessions -Completed)
     $recentDone=@($done | Sort-Object CompletedAt,Order -Descending | Select-Object -First 5)
     try{ if($context){ $machines=(Read-WorkJson (Get-WorkCatalogPath $context)).machines } }
     catch{ Write-Verbose "Machine catalog refresh: $_" }

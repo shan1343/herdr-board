@@ -67,7 +67,7 @@ try {
             @{Pane="test:p$index";Key=$platforms[$index];Name=$platforms[$index];Role="역할 $index"}
         })
         $global:H3MatrixAgents=@(foreach($entry in $configAgents){ @{pane_id=$entry.Pane;agent=$entry.Key;agent_status='working'} })
-        $config=@{BoardTitle='Test board';Session="fixture-$count";HerdrCommand='Invoke-MatrixHerdr';LogRoot='logs';Agents=$configAgents}
+        $config=@{BoardTitle='Test board';Session="fixture-$count";HerdrCommand='Invoke-MatrixHerdr';LogRoot='logs';SharedLogRoot='shared';Agents=$configAgents}
         Write-Fixture $configPath ($config | ConvertTo-Json -Depth 5)
         $global:H3MatrixProcesses=@(for($job=1;$job -le $working;$job++){
             $name="sample-$job"
@@ -84,7 +84,7 @@ try {
         foreach($width in 30,55,80,120){
             foreach($height in 10,20,40){
                 $board=Read-Frame 'board.ps1' @{ConfigPath=$configPath;Once=$true;Width=$width;Height=$height}
-                $background=Read-Frame 'bg-view.ps1' @{LogRoot=$logs;Once=$true;Width=$width;Height=$height}
+                $background=Read-Frame 'bg-view.ps1' @{LogRoot=$logs;SharedLogRoot=(Join-Path $fixture 'shared');Session=$config.Session;Once=$true;Width=$width;Height=$height}
                 Assert-Frame $board $width 'Board'
                 Assert-Frame $background $width 'Background'
                 if(@($board -match '^ .*│ working\s*│').Count -ne $working -or @($background -match '^working').Count -ne $working){

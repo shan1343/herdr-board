@@ -1,4 +1,6 @@
-﻿function Format-BoardElapsed([int]$Minutes,[switch]$Stale) {
+﻿. "$PSScriptRoot/board-scope.ps1"
+
+function Format-BoardElapsed([int]$Minutes,[switch]$Stale) {
     $esc=[char]27
     if($Stale){ return "$esc[33m멈춤?$esc[0m" }
     $elapsed=if($Minutes -lt 60){"$($Minutes)m"}else{"$([int][Math]::Floor($Minutes/60))h$($Minutes%60)m"}
@@ -77,10 +79,14 @@ function Resolve-BoardDevice($Source,$Labels,$Machines){
     if($Source.Name -and $Source.Name -ne [Environment]::MachineName){ return $Source.Name }
 }
 
-function Get-BoardWorkers([string]$LogRoot, [string]$ClaudeSessionsPath) {
+function Get-BoardWorkers([string]$LogRoot,[string]$ClaudeSessionsPath,$Scope) {
+    if (!$Scope) { $Scope=New-BoardWorkerScope -LogRoot $LogRoot -Session 'work-herdr' -SharedLogRoot $LogRoot }
+    $jobIndex=@(Get-BoardWorkerLogIndex $Scope)
+    $owned=@($jobIndex | Where-Object Session -eq $Scope.Session)
     # A single process snapshot supplies counts, elapsed times and log correlation.
+    $available=$true
     try { $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
-    catch { return [pscustomobject]@{ Active=@(); Pending=@(); Available=$false } }
+    catch { $processes=@(); $available=$false }
     $byId = @{}
     foreach ($proc in $processes) { $byId[$proc.ProcessId] = $proc }
 
@@ -102,13 +108,16 @@ function Get-BoardWorkers([string]$LogRoot, [string]$ClaudeSessionsPath) {
         if ($owner -eq 'claude' -and $parent.Name -eq $proc.Name -and
             $parent.CreationDate -le $proc.CreationDate -and $parent.CommandLine -match '\s--bg-pty-host(?:\s|$)') { continue }
 
+        $session=$null
+        if ($owner -eq 'claude' -and $ClaudeSessionsPath) {
+            $session=Read-BoardClaudeWorkerSession $ClaudeSessionsPath $proc.ProcessId
+        }
         if ($owner -eq 'claude' -and $command -match '\s--bg-pty-host(?:\s|$)') {
             # A detached interactive session can retain a host process while idle.
             $child = $processes | Where-Object { $_.ParentProcessId -eq $proc.ProcessId -and $_.Name -eq $proc.Name } | Select-Object -First 1
             if ($child -and $ClaudeSessionsPath) {
-                $sessionFile = Join-Path $ClaudeSessionsPath "$($child.ProcessId).json"
-                try { $session = Get-Content -LiteralPath $sessionFile -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
-                catch { $session = $null }
+                $childSession=Read-BoardClaudeWorkerSession $ClaudeSessionsPath $child.ProcessId
+                if ($childSession) { $session=$childSession }
                 if ($session.kind -eq 'bg' -and $session.status -in 'idle','done','shell') { continue }
             }
         }
@@ -125,6 +134,30 @@ function Get-BoardWorkers([string]$LogRoot, [string]$ClaudeSessionsPath) {
             if ($parent -and $parent.CreationDate -gt $ancestor.CreationDate) { break }
             $ancestor = $parent
         }
+        $launchRoom=Resolve-BoardRoom $Scope $session.herdr_session
+        $cwd=if ($session.cwd) { $session.cwd } elseif ($proc.Cwd) { $proc.Cwd } else { Get-BoardLaunchCwd $flags }
+        if (!$launchRoom) { $launchRoom=Find-BoardProjectSession $Scope.Rooms $cwd }
+        $candidates=@($jobIndex | Where-Object Card -eq $card)
+        $argumentText=$arguments -join "`n"
+        $windowsArguments=$argumentText.Replace('/','\')
+        $direct=@($candidates | Where-Object {
+            $paths=@($_.Files.FullName)+@($_.CardPath)
+            $paths | Where-Object {
+                $_ -and $windowsArguments.IndexOf($_.Replace('/','\'),[StringComparison]::OrdinalIgnoreCase) -ge 0
+            } | Select-Object -First 1
+        })
+        $candidateRooms=@($candidates.Session | Sort-Object -Unique)
+        $tagged=$candidates | Where-Object Tag | Select-Object -First 1
+        $room=if ($direct.Count -eq 1) { $direct[0].Session }
+        elseif ($candidateRooms.Count -gt 1) { if ($launchRoom) { $launchRoom } else { '?' } }
+        elseif ($tagged) { $tagged.Tag }
+        elseif ($launchRoom) { $launchRoom }
+        elseif ($candidateRooms.Count) { $candidateRooms[0] }
+        else { $Scope.Work }
+        if ($room -ne $Scope.Session) { continue }
+        $job=if ($direct.Count -eq 1) { $direct[0] } else { $owned | Where-Object Card -eq $card | Select-Object -First 1 }
+        $cardRoot=if ($job) { $job.Root } else { $null }
+
         $model = $null
         $effort = $null
         for ($index = 1; $index -lt $argv.Count; $index++) {
@@ -151,31 +184,36 @@ function Get-BoardWorkers([string]$LogRoot, [string]$ClaudeSessionsPath) {
             Model=$model
             Effort=$effort
             Card=$card
-            Title=(Get-BoardCardTitle $LogRoot $card '백그라운드 작업')
-            Device=(Get-BoardCardDevice $LogRoot $card ($arguments -join "`n"))
+            Title=$(if ($cardRoot) { Get-BoardCardTitle $cardRoot $card '백그라운드 작업' } elseif ($card) { $card } else { '백그라운드 작업' })
+            Device=(Get-BoardCardDevice $cardRoot $(if ($cardRoot) { $card }) $argumentText)
+            LogPath=$job.EventLog.FullName
+            Root=$cardRoot
             Minutes=[Math]::Max(0, [Math]::Floor(($now - $proc.CreationDate).TotalMinutes))
         }
     })
 
     $activeCards = @($active | Where-Object Card | ForEach-Object Card)
-    $reviewLogs = Get-ChildItem -LiteralPath $LogRoot -Filter 'exec-*' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -eq '.log' -or ($_.Extension -eq '.jsonl' -and $_.Length -gt 0) } |
-        Sort-Object LastWriteTime -Descending
+    $reviewLogs = @($owned | ForEach-Object Files |
+        Where-Object { $_.Extension -eq '.log' -or $_.Length -gt 0 } |
+        Sort-Object LastWriteTime -Descending)
     $seen = @{}
     $pending = @(foreach ($log in $reviewLogs) {
         $card = $log.BaseName.Substring(5)
+        $jobRoot=$log.DirectoryName
         if ($seen[$card] -or $card -in $activeCards -or
-            (Test-Path -LiteralPath (Join-Path $LogRoot "exec-$card.reviewed"))) { continue }
+            (Test-Path -LiteralPath (Join-Path $jobRoot "exec-$card.reviewed"))) { continue }
         $seen[$card] = $true
-        $stderrPath = if ($log.Extension -eq '.jsonl') { Join-Path $LogRoot "exec-$card.err" } else { "$($log.FullName).err" }
+        $stderrPath = if ($log.Extension -eq '.jsonl') { Join-Path $jobRoot "exec-$card.err" } else { "$($log.FullName).err" }
         $stderr = Get-Item -LiteralPath $stderrPath -ErrorAction SilentlyContinue
         $lastWrite = $log.LastWriteTime
         if ($stderr -and $stderr.LastWriteTime -gt $lastWrite) { $lastWrite = $stderr.LastWriteTime }
         # Some wrappers provide no card name. Defer a potential match while its process is alive.
         if ($active | Where-Object { $_.Agent -eq 'codex' -and -not $_.Card -and $now.AddMinutes(-($_.Minutes + 1)) -le $lastWrite }) { continue }
-        [pscustomobject]@{ Title=(Get-BoardCardTitle $LogRoot $card $card) }
+        [pscustomobject]@{ Title=(Get-BoardCardTitle $jobRoot $card $card) }
     })
-    [pscustomobject]@{ Active=$active; Pending=$pending; Available=$true }
+    $localOwners=@{}
+    foreach ($entry in ($jobIndex | Where-Object Root -eq $Scope.LogRoot)) { $localOwners[$entry.Card]=$entry.Session }
+    [pscustomobject]@{ Active=$active; Pending=$pending; Jobs=$owned; LocalOwners=$localOwners; Available=$available }
 }
 
 function Test-BoardStale([string]$Root,[string]$Card,[DateTimeOffset]$Now){
