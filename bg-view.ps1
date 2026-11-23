@@ -1,4 +1,4 @@
-﻿param([ValidateRange(1,3600)][int]$Refresh=5,[switch]$Once,[int]$Width,[int]$Height,[string]$LogRoot,[switch]$Demo,
+﻿param([ValidateRange(1,3600)][int]$Refresh=5,[ValidateRange(1,3600)][int]$IdleRefresh=15,[switch]$Once,[int]$Width,[int]$Height,[string]$LogRoot,[switch]$Demo,
       [string]$Session,[string]$SharedLogRoot,[string]$ProjectPath,[string]$CodexSessionsPath)
 # Live background jobs with their latest steps and one completed summary. Token-free (reads logs\exec-*.jsonl).
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -57,7 +57,7 @@ while($true){
   $w=[Math]::Max(1,$cols-1)
   $limit=[Math]::Max(1, $(if($Height){$Height}else{$size.Height})-1)
   $out=[Collections.Generic.List[string]]::new()
-  $out.Add("$e[1;97;48;2;233;84;32m  백그라운드  $($now.ToString('HH:mm:ss'))  v2.9  $cX")
+  $out.Add("$e[1;97;48;2;233;84;32m  백그라운드  $($now.ToString('HH:mm:ss'))  v2.11  $cX")
   $jobs=@()
   if($Demo){ $running=@((Get-BoardDemo $now).Workers.Active) }
   else{
@@ -108,6 +108,8 @@ while($true){
   $frame=@($out | ForEach-Object { Fit-BoardLine $_ $w })
   if($Once){ [Console]::Write(($frame -join [Environment]::NewLine)); break }
   Write-BoardFrame $frame
+  $waitSeconds=if($running.Count){ $Refresh }else{ [Math]::Max($Refresh,$IdleRefresh) }
+  $refreshAt=$now.UtcDateTime.AddSeconds($waitSeconds)
   while([DateTime]::UtcNow -lt $refreshAt){
     Start-Sleep -Milliseconds 100
     $current=$Host.UI.RawUI.WindowSize

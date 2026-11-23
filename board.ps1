@@ -1,5 +1,6 @@
 ﻿param(
-    [ValidateRange(1,3600)][int]$Refresh=30,
+    [ValidateRange(1,3600)][int]$Refresh=5,
+    [ValidateRange(1,3600)][int]$SlowRefresh=30,
     [string]$ConfigPath=(Join-Path $PSScriptRoot 'board.config.json'),
     [ValidateRange(1,1000)][int]$Width,
     [ValidateRange(1,1000)][int]$Height,
@@ -7,7 +8,7 @@
     [switch]$Once
 )
 
-$Version='v2.9'
+$Version='v2.11'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . "$PSScriptRoot\board-demo.ps1"
 . "$PSScriptRoot\board-render.ps1"
@@ -117,15 +118,77 @@ function Get-BoardHerdrList([string]$Resource){
     if($LASTEXITCODE -ne 0 -or !$response.result){ throw "Herdr $Resource list failed." }
     $response.result
 }
-function Get-BoardTaskRows([string]$Backlog,$Workers,$Sessions,$UsageRows,[switch]$Completed){
+function Get-BoardRooms {
+    # Every work room's backlog: Work (logs) plus each defined space. The current room is excluded by the caller.
+    $labels=$config.RoomLabels
+    $workLabel=if($labels -and $labels.'work-herdr'){$labels.'work-herdr'}else{'Work'}
+    [pscustomobject]@{Key='work-herdr';Label=$workLabel;Root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'logs'))}
+    foreach($definition in @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'spaces') -Filter '*.json' -File -ErrorAction SilentlyContinue)){
+        $name=$definition.BaseName
+        if($name -match '^(test|roles-|h\d+-|g3-plan-)'){ continue }
+        $root=Join-Path $PSScriptRoot "spaces\$name\logs"
+        if(!(Test-Path -LiteralPath (Join-Path $root 'backlog.md')) -and !(Test-Path -LiteralPath (Join-Path $root 'backlog-done.md'))){ continue }
+        $d=$null
+        try{ $d=Get-Content -LiteralPath $definition.FullName -Raw -Encoding UTF8 | ConvertFrom-Json }catch{}
+        if($d -and $d.Fixture -eq $true){ continue }
+        $label=if($labels -and $labels.$name){$labels.$name}elseif($d -and $d.Label){$d.Label}else{$name}
+        [pscustomobject]@{Key="space-$name";Label=$label;Root=[IO.Path]::GetFullPath($root)}
+    }
+}
+function Get-BoardRoomLeads {
+    # Live lead (지휘) of every other running room, shown as a working row tagged with the room label.
+    $labels=$config.RoomLabels
+    $rooms=@([pscustomobject]@{Key='work-herdr';Label=$(if($labels -and $labels.'work-herdr'){$labels.'work-herdr'}else{'Work'});Registry=(Join-Path $PSScriptRoot 'logs\sessions.json')})
+    foreach($definition in @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'spaces') -Filter '*.json' -File -ErrorAction SilentlyContinue)){
+        $name=$definition.BaseName
+        if($name -match '^(test|roles-|h\d+-|g3-plan-)'){ continue }
+        $registry=Join-Path $PSScriptRoot "spaces\$name\logs\sessions.json"
+        if(!(Test-Path -LiteralPath $registry)){ continue }
+        $d=$null
+        try{ $d=Get-Content -LiteralPath $definition.FullName -Raw -Encoding UTF8 | ConvertFrom-Json }catch{}
+        if($d -and $d.Fixture -eq $true){ continue }
+        $label=if($labels -and $labels.$name){$labels.$name}elseif($d -and $d.Label){$d.Label}else{$name}
+        $rooms+=[pscustomobject]@{Key="space-$name";Label=$label;Registry=$registry}
+    }
+    foreach($room in $rooms){
+        if($workerScope -and $room.Key -eq $workerScope.Session){ continue }
+        if(!(Test-Path -LiteralPath (Join-Path $env:APPDATA "herdr\sessions\$($room.Key)\herdr.sock"))){ continue }
+        try{
+            $plan=Get-Content -LiteralPath $room.Registry -Raw -Encoding UTF8 | ConvertFrom-Json
+            $lead=$plan.Sessions | Where-Object { $_.Id -eq $plan.Lead -and $_.Active -and $_.Pane } | Select-Object -First 1
+            if(!$lead){ continue }
+            $response=& $config.HerdrCommand --session $room.Key agent list 2>$null | Out-String | ConvertFrom-Json -ErrorAction Stop
+            $live=@($response.result.agents) | Where-Object { $_.pane_id -eq $lead.Pane -and $_.agent -eq $lead.Kind } | Select-Object -First 1
+            if(!$live -or $live.agent_status -notin 'working','blocked'){ continue }
+            $title=[string]$live.terminal_title_stripped
+            if(!$title -or $title -match '^(관리자|Administrator)?:?\s*[A-Z]:\\'){ $title='작업 중' }
+            $state=$live.agent_status
+            [pscustomobject]@{Kind=$lead.Kind;Owner=$agentNames[$lead.Kind];State=$state;SourceState=$state;Title="$($lead.Role) · $title";Minutes=$(if($state -eq 'working'){Get-BoardWorkingMinutes "lead:$($room.Key)"});Room=$room.Label;Order=0}
+        }catch{ Write-Verbose "Room lead $($room.Key): $_" }
+    }
+}
+function Get-BoardTaskRows([string]$Backlog,$Workers,$Sessions,$UsageRows,[switch]$Completed,[string]$Room,[string]$RoomRoot,[string]$RoomKey){
     $ordinal=0
-    if(!$Completed){
+    if(!$Completed -and !$Room){
         foreach($worker in $Workers.Active){
             $ordinal++
             [pscustomobject]@{Kind=$worker.Agent;Owner=$agentNames[$worker.Agent];State='working';Title=$worker.Title;Minutes=$worker.Minutes;Model=$worker.Model;Effort=$worker.Effort;Device=$worker.Device;Card=$worker.Card;Root=$worker.Root;Order=$ordinal}
         }
     }
-    foreach($line in ($Backlog -split '\r?\n')){
+    $backlogLines=@($Backlog -split '\r?\n')
+    $ownerWorkingCounts=@{}
+    if(!$Completed){
+        foreach($line in $backlogLines){
+            if($line -notmatch '^\|\s*\d+\s*\|'){ continue }
+            $cells=@($line.Trim().Trim('|') -split '\|' | ForEach-Object Trim)
+            if($cells.Count -ne 4){ continue }
+            $rowState=if($taskStatuses.ContainsKey($cells[3])){$taskStatuses[$cells[3]]}else{$cells[3]}
+            if($rowState -ne 'working'){ continue }
+            $rowKind=if($cells[2] -match '^(claude|codex|agy|you)(?:-\d+|\(bg\))?$'){$Matches[1].ToLowerInvariant()}elseif($cells[2] -eq '일꾼'){'codex'}else{$null}
+            if($rowKind){ $ownerWorkingCounts[$rowKind]=1+[int]$ownerWorkingCounts[$rowKind] }
+        }
+    }
+    foreach($line in $backlogLines){
         if($line -notmatch '^\|\s*(\d+)\s*\|'){ continue }
         $cells=@($line.Trim().Trim('|') -split '\|' | ForEach-Object Trim)
         $completedAt=$null
@@ -141,37 +204,51 @@ function Get-BoardTaskRows([string]$Backlog,$Workers,$Sessions,$UsageRows,[switc
         $kind=$null
         $session=$Sessions | Where-Object { $owner -in @($_.Id,$_.ProfileId,$_.Role) } | Select-Object -First 1
         if($session){ $kind=$session.Kind }
-        elseif($owner -match '^(claude|codex|agy|you)(?:-\d+|\(bg\))?$'){ $kind=$Matches[1] }
+        elseif($owner -match '^(claude|codex|agy|you)(?:-\d+|\(bg\))?$'){ $kind=$Matches[1].ToLowerInvariant() }
         elseif($owner -like '사용자*'){ $kind='you' }
         elseif($owner -eq '일꾼'){ $kind='codex' }
         if($kind){ $owner=$agentNames[$kind] }
-        $card=if(!$Demo){ Get-BoardBacklogCard $logRoot $cells[0] $cells[1] }
-        if ($card) {
+        $cardRoot=if($RoomRoot){$RoomRoot}else{$logRoot}
+        $card=if(!$Demo){ Get-BoardBacklogCard $cardRoot $cells[0] $cells[1] }
+        if ($card -and !$Room) {
             $cardRoom=if ($Workers.LocalOwners) { $Workers.LocalOwners[$card] }
             if ($cardRoom -and $cardRoom -ne $workerScope.Session) { continue }
         }
-        if($state -eq 'working' -and ($Workers.Active | Where-Object {
+        if(!$Room -and $state -eq 'working' -and ($Workers.Active | Where-Object {
             ($_.Card -and $_.Card -eq $card) -or ($_.Title -eq $cells[1] -and $_.Agent -eq $kind)
         })){ continue }
         $ordinal++
         $usage=$null
-        if($state -eq 'working' -and $kind){
+        if(!$Room -and $state -eq 'working' -and $kind){
             if(!$session){
                 $platformSessions=@($Sessions | Where-Object Kind -eq $kind)
                 if($platformSessions.Count -eq 1){ $session=$platformSessions[0] }
             }
             if($session){ $usage=$UsageRows | Where-Object Id -eq $session.Id | Select-Object -First 1 }
         }
-        $minutes=if($state -eq 'working'){Get-BoardWorkingMinutes "task:$($cells[0])"}
-        $device=if($card){ Get-BoardCardDevice $logRoot $card }
-        [pscustomobject]@{Kind=$kind;Owner=$owner;State=$state;Title=$cells[1];SourceState=$cells[3];Minutes=$minutes;Model=$usage.Model;Effort=$usage.Effort;Device=$device;Card=$card;CompletedAt=$completedAt;Order=$ordinal}
+        $reportedDone=$false
+        if(!$Demo -and !$Completed -and $state -eq 'working'){
+            $effRoomKey=if($RoomKey){$RoomKey}elseif($workerScope){$workerScope.Session}else{'work-herdr'}
+            $owCount=if($kind -and $ownerWorkingCounts.ContainsKey($kind)){[int]$ownerWorkingCounts[$kind]}else{1}
+            $reportedDone=Test-BoardReportedDone $cardRoot $card $cells[1] $kind $effRoomKey $owCount
+        }
+        $minutes=if($state -eq 'working' -and !$reportedDone){Get-BoardWorkingMinutes "task:$Room$($cells[0])"}
+        $device=if($card){ Get-BoardCardDevice $cardRoot $card }
+        [pscustomobject]@{Kind=$kind;Owner=$owner;State=$state;Title=$cells[1];SourceState=$cells[3];Minutes=$minutes;Model=$usage.Model;Effort=$usage.Effort;Device=$device;Card=$card;CompletedAt=$completedAt;Order=$ordinal;Room=$Room;Root=$RoomRoot;ReportedDone=$reportedDone}
     }
 }
 function Format-BoardTask($Task){
     $content=Clean-BoardText $Task.Title
     $device=Clean-BoardText (Resolve-BoardDevice $Task.Device $config.MachineLabels $machines)
     if($device){ $content="$tagColor[$device]$reset $content" }
-    if($Task.State -eq 'working'){
+    if($Task.Room){ $content="$tagColor[$(Clean-BoardText $Task.Room)]$reset $content" }
+    $middleColor=$stateColors[$Task.State]
+    if($Task.State -eq 'working' -and $Task.ReportedDone){
+        $middleColor="$esc[33m"
+        $suffix=" · $esc[33m완료 보고됨 · 확인 필요$reset"
+        $titleWidth=$w-$nameWidth-$middleWidth-7-(Get-BoardTextWidth ($suffix -replace '\x1b\[[0-9;]*m',''))
+        $content=(Fit-BoardLine $content ([Math]::Max(1,$titleWidth)))+$suffix
+    }elseif($Task.State -eq 'working'){
         $activityRoot=if ($Task.Root) { $Task.Root } else { $logRoot }
         $stale=Test-BoardStale $activityRoot $Task.Card $now
         $elapsed=" · $(Format-BoardElapsed $Task.Minutes -Stale:$stale)"
@@ -196,10 +273,14 @@ function Format-BoardTask($Task){
         $titleWidth=$w-$nameWidth-$middleWidth-7-(Get-BoardTextWidth ($suffix -replace '\x1b\[[0-9;]*m',''))
         $content=(Fit-BoardLine $content ([Math]::Max(1,$titleWidth)))+$suffix
     }
-    Format-BoardRow $Task.Owner $Task.Kind $Task.State $stateColors[$Task.State] $content
+    Format-BoardRow $Task.Owner $Task.Kind $Task.State $middleColor $content
 }
 
 $lastSessions=@()
+$lastAgents=@()
+$herdrMisses=0
+$slowCache=$null
+$roomLeadsCache=$null
 $startedWorking=@{}
 $machines=$null
 while($true){
@@ -214,9 +295,15 @@ while($true){
     if($Demo){ $data=Get-BoardDemo $now }
     else{
         $agents=@()
-        try{ $agents=@((Get-BoardHerdrList 'agent').agents | Where-Object pane_id) }catch{}
+        $herdrOk=$false
+        try{ $agents=@((Get-BoardHerdrList 'agent').agents | Where-Object pane_id); $herdrOk=$true; $herdrMisses=0 }
+        catch{ $herdrMisses++ }
         $sessions=@()
-        if($agents.Count){
+        if(!$herdrOk -and $lastSessions.Count -and $herdrMisses -lt 3){
+            $agents=$lastAgents
+            $sessions=$lastSessions
+        }elseif($agents.Count){
+            $lastAgents=$agents
             if($hasConfiguredAgents){
                 $sessions=@(foreach($entry in $config.Agents){
                     $live=$agents | Where-Object pane_id -eq $entry.Pane | Select-Object -First 1
@@ -225,13 +312,39 @@ while($true){
                     [pscustomobject]@{Id=$entry.Pane;ProfileId=$entry.Key;Kind=$kind;Name=$entry.Name;Role=$entry.Role;Pane=$entry.Pane;Conversation=$live.agent_session.value}
                 })
             }else{
+                $registry=$null
                 try{
                     $panes=@((Get-BoardHerdrList 'pane').panes)
                     $registry=Read-WorkRegistry $context
                     $plan=Get-WorkSessionPlan $context $agents $panes
-                    $sessions=@($plan.Sessions | Where-Object Active | Where-Object { $_.Pane -in $agents.pane_id })
+                    $activeRows=@($plan.Sessions | Where-Object Active)
+                    $retiredPanes=@($plan.Sessions | Where-Object { !$_.Active -and $_.Pane } | ForEach-Object Pane)
+                    $usedPanes=@{}
+                    foreach($p in $retiredPanes){ $usedPanes[$p]=$true }
+                    $matchedRows=@($activeRows | Where-Object { $_.Pane -and $_.Pane -in $agents.pane_id })
+                    foreach($m in $matchedRows){ $usedPanes[$m.Pane]=$true }
+                    $unmatchedRows=@($activeRows | Where-Object { !$_.Pane -or $_.Pane -notin $agents.pane_id })
+                    $rescued=@{}
+                    foreach($u in $unmatchedRows){
+                        $pool=@($agents | Where-Object { $_.agent -eq $u.Kind -and !$usedPanes[$_.pane_id] })
+                        $picked=$pool | Where-Object { $_.name -and $_.name -in @($u.Id,$u.ProfileId) } | Select-Object -First 1
+                        if(!$picked -and $pool.Count -eq 1 -and @($unmatchedRows | Where-Object Kind -eq $u.Kind).Count -eq 1){ $picked=$pool[0] }
+                        if($picked){
+                            $usedPanes[$picked.pane_id]=$true
+                            $rescued[$u.Id]=$picked
+                        }
+                    }
+                    $sessions=@(foreach($row in $activeRows){
+                        if($row.Pane -and $row.Pane -in $agents.pane_id){ $row }
+                        elseif($rescued.ContainsKey($row.Id)){
+                            $pick=$rescued[$row.Id]
+                            [pscustomobject]@{Id=$row.Id;ProfileId=$row.ProfileId;Kind=$row.Kind;Name=$row.Name;Role=$row.Role;Pane=$pick.pane_id;TerminalId=$pick.terminal_id;Conversation=$pick.agent_session.value}
+                        }else{
+                            [pscustomobject]@{Id=$row.Id;ProfileId=$row.ProfileId;Kind=$row.Kind;Name=$row.Name;Role=$row.Role;Pane=$null;TerminalId=$row.TerminalId;Conversation=$row.Conversation;Offline=$true}
+                        }
+                    })
                     $lastSessions=$sessions
-                    $moved=@($sessions | Where-Object {
+                    $moved=@($matchedRows | Where-Object {
                         $id=$_.Id
                         $pane=$_.Pane
                         $registry.Sessions | Where-Object { $_.Active -and $_.Id -eq $id -and $_.Pane -ne $pane }
@@ -243,15 +356,36 @@ while($true){
                         $previous=$_
                         $agents | Where-Object { $_.pane_id -eq $previous.Pane -and $_.terminal_id -eq $previous.TerminalId }
                     })
+                    if(!$sessions.Count){
+                        $sessions=@(foreach($live in $agents){
+                            $saved=if($registry){ $registry.Sessions | Where-Object { $_.Active -and ($_.Pane -eq $live.pane_id -or ($_.Kind -eq $live.agent -and $_.Id -eq $live.name)) } | Select-Object -First 1 }
+                            $role=if($saved -and $saved.Role){$saved.Role}else{'실행 중'}
+                            $id=if($saved){$saved.Id}elseif($live.name){$live.name}else{$live.pane_id}
+                            [pscustomobject]@{Id=$id;ProfileId=$saved.ProfileId;Kind=$live.agent;Name=$saved.Name;Role=$role;Pane=$live.pane_id;TerminalId=$live.terminal_id;Conversation=$live.agent_session.value}
+                        })
+                    }
                 }
             }
         }
+        # Agent states are cheap (herdr socket) and refresh every frame; background workers, quota and catalog scans are slow, so reuse them for $SlowRefresh seconds.
+        if(!$slowCache -or [DateTime]::UtcNow -ge $slowCache.At.AddSeconds($SlowRefresh) -or (@($sessions.Id) -join ',') -ne $slowCache.Ids){
+            $cachedMachines=$machines
+            try{ if($context){ $cachedMachines=(Read-WorkJson (Get-WorkCatalogPath $context)).machines } }
+            catch{ Write-Verbose "Machine catalog refresh: $_" }
+            $slowCache=[pscustomobject]@{
+                At=[DateTime]::UtcNow; Ids=(@($sessions.Id) -join ',')
+                Workers=(Get-BoardWorkers $logRoot $config.ClaudeSessionsPath $workerScope)
+                Usage=@(Get-BoardUsage $config @($sessions | Where-Object { !$_.Offline }))
+                Machines=$cachedMachines
+            }
+        }
+        $machines=$slowCache.Machines
         $data=[pscustomobject]@{
             Sessions=$sessions; Agents=$agents
-            Workers=(Get-BoardWorkers $logRoot $config.ClaudeSessionsPath $workerScope)
+            Workers=$slowCache.Workers
             Backlog=(Read-BoardUsageText (Join-Path $logRoot 'backlog.md'))
             Done=(Read-BoardUsageText (Join-Path $logRoot 'backlog-done.md'))
-            Usage=@(Get-BoardUsage $config $sessions)
+            Usage=$slowCache.Usage
         }
     }
 
@@ -268,7 +402,14 @@ while($true){
     foreach($worker in $data.Workers.Active){ $backgroundCounts[$worker.Agent]++ }
     $shownPlatforms=@{}
     foreach($session in $data.Sessions){
-        $live=$data.Agents | Where-Object pane_id -eq $session.Pane | Select-Object -First 1
+        $live=if(!$session.Offline){ $data.Agents | Where-Object pane_id -eq $session.Pane | Select-Object -First 1 }
+        if($session.Offline -or !$live){
+            $activity="$esc[31m꺼짐$reset"
+            $name=if($session.Name){ $session.Name }else{ $agentNames[$session.Kind] }
+            $lines.Add((Format-BoardRow $name $session.Kind $session.Role '' $activity))
+            $lines.Add("   $muted—$reset")
+            continue
+        }
         $state=if($live.agent_status -in 'working','blocked','done'){$live.agent_status}else{'idle'}
         $activity="$($stateColors[$state])$state$reset"
         $backgroundCount=$backgroundCounts[$session.Kind]
@@ -294,12 +435,25 @@ while($true){
         $lines.Add("   $detail")
     }
     $agentRows=$lines.Count-$agentStart
-    $tasks=@(Get-BoardTaskRows $data.Backlog $data.Workers $data.Sessions $data.Usage | Sort-Object { if($taskOrder.ContainsKey($_.State)){$taskOrder[$_.State]}else{4} },Order)
+    $roomTasks=@(); $roomDone=@()
+    if(!$Demo -and $config.ShareRooms -eq $true){
+        $currentRoot=[IO.Path]::GetFullPath($logRoot).TrimEnd('\')
+        foreach($room in @(Get-BoardRooms)){
+            if($room.Root.TrimEnd('\') -ieq $currentRoot){ continue }
+            $roomTasks+=@(Get-BoardTaskRows (Read-BoardUsageText (Join-Path $room.Root 'backlog.md')) $null $null -Room $room.Label -RoomRoot $room.Root -RoomKey $room.Key)
+            $roomDone+=@(Get-BoardTaskRows (Read-BoardUsageText (Join-Path $room.Root 'backlog-done.md')) $null $null -Completed -Room $room.Label -RoomRoot $room.Root -RoomKey $room.Key)
+        }
+        $leadsTtl=[Math]::Min($SlowRefresh,15)
+        if(!$roomLeadsCache -or [DateTime]::UtcNow -ge $roomLeadsCache.At.AddSeconds($leadsTtl)){
+            $roomLeadsCache=[pscustomobject]@{At=[DateTime]::UtcNow;Rows=@(Get-BoardRoomLeads)}
+        }
+        $roomTasks=@(@($roomLeadsCache.Rows)+$roomTasks)
+    }
+    $currentRoomKey=if($workerScope){$workerScope.Session}else{'work-herdr'}
+    $tasks=@(@(Get-BoardTaskRows $data.Backlog $data.Workers $data.Sessions $data.Usage -RoomKey $currentRoomKey)+$roomTasks | Sort-Object { if($taskOrder.ContainsKey($_.State)){$taskOrder[$_.State]}else{4} },{ [bool]$_.Room },Order)
     $visibleTasks=@($tasks)
-    $done=@(Get-BoardTaskRows $data.Done $data.Workers $data.Sessions -Completed)
+    $done=@(@(Get-BoardTaskRows $data.Done $data.Workers $data.Sessions -Completed -RoomKey $currentRoomKey)+$roomDone)
     $recentDone=@($done | Sort-Object CompletedAt,Order -Descending | Select-Object -First 5)
-    try{ if($context){ $machines=(Read-WorkJson (Get-WorkCatalogPath $context)).machines } }
-    catch{ Write-Verbose "Machine catalog refresh: $_" }
     $lines.Add('')
     $lines.Add("$($bold)작업 $($tasks.Count)$reset")
     $taskStart=$lines.Count

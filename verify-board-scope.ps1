@@ -110,8 +110,8 @@ try {
     foreach ($session in $active.Keys) {
         $others=@(foreach ($other in $active.Keys) { if ($other -ne $session) { $active[$other] } })
         $foreignSummaries=@($summary.Values | Where-Object { $_ -ne $summary[$session] })
-        Assert-Frame $frames[$session].Board ($active[$session]+@('v2.9')) ($others+@('ForeignBacklogMarker')) "$session board"
-        Assert-Frame $frames[$session].Background ($active[$session]+@($summary[$session],'v2.9')) ($others+$foreignSummaries+@('BetaDoneSummary' | Where-Object { $session -ne 'space-beta' })) "$session background"
+        Assert-Frame $frames[$session].Board ($active[$session]+@('v2.11')) ($others+@('ForeignBacklogMarker')) "$session board"
+        Assert-Frame $frames[$session].Background ($active[$session]+@($summary[$session],'v2.11')) ($others+$foreignSummaries+@('BetaDoneSummary' | Where-Object { $session -ne 'space-beta' })) "$session background"
         $working=[regex]::Matches($frames[$session].Background,'(?m)^working ').Count
         if ($working -ne $active[$session].Count) { throw "$session displayed $working workers for $($active[$session].Count) owned jobs. $($frames[$session].Background)" }
         $checks++

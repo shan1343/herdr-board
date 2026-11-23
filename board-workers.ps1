@@ -85,7 +85,7 @@ function Get-BoardWorkers([string]$LogRoot,[string]$ClaudeSessionsPath,$Scope) {
     $owned=@($jobIndex | Where-Object Session -eq $Scope.Session)
     # A single process snapshot supplies counts, elapsed times and log correlation.
     $available=$true
-    try { $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+    try { $processes = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate -ErrorAction Stop) }
     catch { $processes=@(); $available=$false }
     $byId = @{}
     foreach ($proc in $processes) { $byId[$proc.ProcessId] = $proc }
@@ -220,6 +220,75 @@ function Test-BoardStale([string]$Root,[string]$Card,[DateTimeOffset]$Now){
     if(!$Card){ return $false }
     $log=Get-Item -LiteralPath (Join-Path $Root "exec-$Card.jsonl") -ErrorAction SilentlyContinue
     [bool]($log -and ($Now.UtcDateTime-$log.LastWriteTimeUtc).TotalMinutes -gt 10)
+}
+function Test-BoardReportedDone([string]$Root,[string]$Card,[string]$Title,[string]$OwnerKind,[string]$RoomKey,[int]$OwnerWorkingCount=1){
+    if(!$Root){ return $false }
+    $codes=[Collections.Generic.List[string]]::new()
+    if($Card){ $codes.Add($Card) }
+    if($Title -match '(?i)\b([A-Z]+\d+)\b'){
+        $short=$Matches[1]
+        if($short -notin $codes){ $codes.Add($short) }
+    }
+    $flagDirs=[Collections.Generic.List[string]]::new()
+    $flagDirs.Add($Root)
+    if($RoomKey -match '^space-(.+)$'){
+        $spaceName=$Matches[1]
+        $effText=Read-BoardUsageText (Join-Path $PSScriptRoot "spaces\$spaceName\effective-space.json")
+        $projectPath=$null
+        if($effText){ try{ $projectPath=(ConvertFrom-Json -InputObject $effText -ErrorAction Stop).ProjectPath }catch{} }
+        if($projectPath){
+            $flagDirs.Add($projectPath)
+            $flagDirs.Add((Join-Path $projectPath 'work'))
+        }else{
+            $umbrella=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+            $guessed=Join-Path $umbrella $spaceName
+            if(Test-Path -LiteralPath $guessed -PathType Container){
+                $flagDirs.Add($guessed)
+                $flagDirs.Add((Join-Path $guessed 'work'))
+            }
+        }
+    }
+    foreach($code in $codes){
+        foreach($dir in $flagDirs){
+            if(Test-Path -LiteralPath (Join-Path $dir "$code-done.flag") -PathType Leaf){ return $true }
+            if(Test-Path -LiteralPath (Join-Path $dir "done-$code.flag") -PathType Leaf){ return $true }
+        }
+    }
+    $backlogFile=Get-Item -LiteralPath (Join-Path $Root 'backlog.md') -ErrorAction SilentlyContinue
+    $backlogUtc=if($backlogFile){ $backlogFile.LastWriteTimeUtc }else{ [DateTime]::MinValue }
+    if($Card){
+        $execLog=Get-Item -LiteralPath (Join-Path $Root "exec-$Card.jsonl") -ErrorAction SilentlyContinue
+        if($execLog -and $execLog.LastWriteTimeUtc -ge $backlogUtc){
+            $tail=Read-BoardUsageText $execLog.FullName 16384
+            if($tail -and $tail -match '"type"\s*:\s*"turn\.completed"'){ return $true }
+        }
+    }
+    if($OwnerKind){
+        $relayFiles=@(Get-ChildItem -LiteralPath $Root -Filter "relay-$OwnerKind*.jsonl" -File -ErrorAction SilentlyContinue)
+        foreach($rf in $relayFiles){
+            if($rf.LastWriteTimeUtc -lt $backlogUtc){ continue }
+            $raw=Read-BoardUsageText $rf.FullName 65536
+            if(!$raw){ continue }
+            $lines=$raw -split '\r?\n'
+            for($i=$lines.Count-1; $i -ge 0; $i--){
+                $line=$lines[$i]
+                if(!$line -or $line -notmatch '"submitted-and-settled"'){ continue }
+                try{ $entry=ConvertFrom-Json -InputObject $line -ErrorAction Stop }catch{ continue }
+                if($entry.status -ne 'submitted-and-settled'){ continue }
+                $at=ConvertTo-BoardUsageDate $entry.at
+                if(!$at -or $at.UtcDateTime -lt $backlogUtc){ continue }
+                $msg=[string]$entry.message
+                $isFinal=($msg -match '(?i)done\.flag|최종\s*종료|루프\s*종료|감사\s*완료|작업\s*완료|완료\s*보고') -or
+                         ($msg -match '완료' -and $msg -notmatch '(?:진행|예정)\s*[.!?]?\s*$')
+                if(!$isFinal){ continue }
+                if($OwnerWorkingCount -le 1){ return $true }
+                foreach($code in $codes){
+                    if($msg -match ("(?i)(?<![A-Za-z0-9_-])$([regex]::Escape($code))(?![A-Za-z0-9_-])")){ return $true }
+                }
+            }
+        }
+    }
+    $false
 }
 function Write-BoardFrame($Lines){
     $esc=[char]27

@@ -22,8 +22,13 @@ function New-BoardWorkerScope([string]$LogRoot,[string]$Session,[string]$SharedL
         if (!$state) { continue }
         try { $project=ConvertFrom-Json -InputObject $state -ErrorAction Stop } catch { continue }
         if ($project.Name -ne $folder.Name) { continue }
+        $label=$project.Label
+        if (!$label) {
+            $defText=Read-BoardUsageText (Join-Path $spacesRoot "$($folder.Name).json")
+            if ($defText) { try { $label=(ConvertFrom-Json -InputObject $defText -ErrorAction Stop).Label } catch {} }
+        }
         $name='space-'+$folder.Name
-        $rooms[$name]=[pscustomobject]@{ Name=$folder.Name; Project=$project.CatalogProject; Path=(ConvertTo-BoardPath $project.ProjectPath) }
+        $rooms[$name]=[pscustomobject]@{ Name=$folder.Name; Label=$label; Project=$project.CatalogProject; Path=(ConvertTo-BoardPath $project.ProjectPath) }
         $roots[(Join-Path $folder.FullName 'logs')]=$name
     }
     if (!$Session) { $Session=$sessionFromPane }
@@ -48,7 +53,7 @@ function New-BoardWorkerScope([string]$LogRoot,[string]$Session,[string]$SharedL
     }
     [pscustomobject]@{
         Session=$Session; Work=$work; LogRoot=$local; SharedLogRoot=$shared; Rooms=$rooms; Roots=$roots
-        CodexSessionsPath=$CodexSessionsPath; Rollouts=@{}; RolloutsScanned=[DateTime]::MinValue
+        CodexSessionsPath=$CodexSessionsPath; Rollouts=@{}; RolloutsScanned=[DateTime]::MinValue; FileCache=@{}
     }
 }
 
@@ -78,7 +83,7 @@ function Resolve-BoardRoom($Scope,[string]$Name) {
     if ($Name -in 'Work','Work 작업실',$Scope.Work) { return $Scope.Work }
     if ($Name -eq $Scope.Session -or $Scope.Rooms.ContainsKey($Name)) { return $Name }
     $owners=@(foreach ($room in $Scope.Rooms.GetEnumerator()) {
-        if ($Name -in $room.Value.Name,$room.Value.Project) { $room.Key }
+        if ($Name -in $room.Value.Name,$room.Value.Project,$room.Value.Label) { $room.Key }
     })
     if ($owners.Count -eq 1) { return $owners[0] }
     if ($owners.Count -gt 1) { return '?' }
@@ -169,12 +174,26 @@ function Get-BoardWorkerLogIndex($Scope) {
         foreach ($group in ($files | Group-Object { $_.BaseName.Substring(5) })) {
             $card=$group.Name
             $logs=@($group.Group | Where-Object Extension -in '.log','.jsonl')
-            $cardPath=($group.Group | Where-Object Extension -eq '.md').FullName
+            $cardFile=$group.Group | Where-Object Extension -eq '.md' | Select-Object -First 1
+            $cardPath=if ($cardFile) { $cardFile.FullName }
             $eventLog=$logs | Where-Object Extension -eq '.jsonl' | Select-Object -First 1
-            $tag=if ($cardPath) { Get-BoardCardRoom $Scope $root $card }
+            $tag=$null
+            if ($cardFile) {
+                $cardKey="card|$($cardFile.FullName)|$($cardFile.LastWriteTimeUtc.Ticks)|$($cardFile.Length)"
+                if ($Scope.FileCache -and $Scope.FileCache.ContainsKey($cardKey)) { $tag=$Scope.FileCache[$cardKey] }
+                else {
+                    $tag=Get-BoardCardRoom $Scope $root $card
+                    if ($Scope.FileCache) { $Scope.FileCache[$cardKey]=$tag }
+                }
+            }
             $room=$tag
             if (!$room -and $eventLog) {
-                $launch=Read-BoardWorkerLaunch $eventLog.FullName
+                $logKey="log|$($eventLog.FullName)|$($eventLog.LastWriteTimeUtc.Ticks)|$($eventLog.Length)"
+                if ($Scope.FileCache -and $Scope.FileCache.ContainsKey($logKey)) { $launch=$Scope.FileCache[$logKey] }
+                else {
+                    $launch=Read-BoardWorkerLaunch $eventLog.FullName
+                    if ($Scope.FileCache) { $Scope.FileCache[$logKey]=$launch }
+                }
                 $room=Resolve-BoardRoom $Scope $launch.Session
                 if (!$room) { $room=Find-BoardProjectSession $Scope.Rooms $launch.Cwd }
                 # Prefer the local room context for its own logs. Shared Codex logs

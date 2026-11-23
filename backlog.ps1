@@ -10,6 +10,7 @@ param(
  [ValidateRange(1,60)][int]$LockTimeoutSeconds=10
 )
 $ErrorActionPreference='Stop'
+if(!$LogRoot -and $env:HERDR_SESSION -match '^space-(.+)$' -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot "spaces\$($Matches[1]).json"))){ $LogRoot=Join-Path $PSScriptRoot "spaces\$($Matches[1])\logs" }
 if(!$LogRoot){ $LogRoot=Join-Path $PSScriptRoot 'logs' }
 $utf8=[Text.UTF8Encoding]::new($true)
 $LogRoot=[IO.Path]::GetFullPath($LogRoot)
